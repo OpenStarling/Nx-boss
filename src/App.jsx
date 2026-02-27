@@ -1,151 +1,137 @@
-import React, { useState, useEffect } from 'react';
-import './App.css';
+import React, { useState } from "react";
+import "./App.css";
 import AnalyticsDashboard from "./AnalyticsDashboard";
 
 function App() {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState(null);
-  const [view, setView] = useState('home');
-  const [file, setFile] = useState(null);
-  const [statusIndex, setStatusIndex] = useState(0);
-
-  // Список статусов для создания "эффекта работы"
-  const statuses = [
-    "Подключение к шлюзу ГБД ЮЛ...",
-    "Извлечение БИН из реестра...",
-    "Поиск связей через ИИН учредителей...",
-    "Запуск DeepSeek R1 для оценки рисков...",
-    "Формирование графа аффилированности...",
-    "Почти готово, упаковываем данные..."
-  ];
-
-  useEffect(() => {
-    let interval;
-    if (loading) {
-      interval = setInterval(() => {
-        setStatusIndex((prev) => (prev + 1) % statuses.length);
-      }, 2500);
-    } else {
-      setStatusIndex(0);
-    }
-    return () => clearInterval(interval);
-  }, [loading]);
+  const [view, setView] = useState("home"); // home | scanning | result
+  const [error, setError] = useState("");
 
   const handleAnalyze = async (e) => {
     e.preventDefault();
+    setError("");
+
+    const file = e.target?.file?.files?.[0];
     if (!file) {
-      alert("Выберите Excel файл!");
+      setError("Выберите Excel-файл (.xlsx) перед анализом.");
       return;
     }
 
     setLoading(true);
-    setView('scanning');
-
-    const formData = new FormData();
-    formData.append("file", file); 
+    setView("scanning");
 
     try {
-      const response = await fetch('http://localhost:3001/api/analyze', {
-        method: 'POST',
+      const formData = new FormData();
+      formData.append("file", file);
+
+      // ВАЖНО: относительный путь, работает через Vite proxy -> http://127.0.0.1:8000
+      const response = await fetch("/api/analyze", {
+        method: "POST",
         body: formData,
       });
 
-      const result = await response.json();
-
       if (!response.ok) {
-        alert(result.detail || result.error || "Ошибка анализа");
-        setView('home');
-        return;
+        // попробуем прочитать текст/JSON ошибки
+        let detail = "";
+        try {
+          const maybeJson = await response.json();
+          detail = maybeJson?.detail ? String(maybeJson.detail) : JSON.stringify(maybeJson);
+        } catch {
+          detail = await response.text();
+        }
+        throw new Error(detail || `HTTP ${response.status}`);
       }
 
-      setData(result);
-      setView('result');
+      const result = await response.json();
 
+      setData(result);
+      setView("result");
     } catch (err) {
-      console.error("Connection error:", err);
-      alert("Ошибка сервера. Убедись, что Python-бэкенд запущен!");
-      setView('home');
+      console.error(err);
+
+      // дружелюбная ошибка для пользователя
+      const msg = String(err?.message || "");
+      setError(
+        msg.includes("Failed to fetch")
+          ? "Не удалось подключиться к серверу. Убедись, что Python-бэкенд запущен (uvicorn на 8000) и Vite proxy настроен."
+          : `Ошибка сервера: ${msg}`
+      );
+
+      setView("home");
+      setData(null);
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="app-container">
-      <nav className="sidebar">
-        <div className="logo">NX-BOSS <span>AI</span></div>
-        <ul className="nav-links">
-          <li className={view === 'home' ? 'active' : ''} onClick={() => setView('home')}>
-            📂 Загрузка реестра
-          </li>
-          <li>📊 Мои Реестры</li>
-          <li>📜 История аудита</li>
-          <li>⚙️ Настройки</li>
-        </ul>
-        <div className="sidebar-footer">
-          <p>Версия: 2.0.0 (DeepSeek 8b + GBDUL)</p>
+    <div className="app">
+      <header className="app-header">
+        <div className="brand">
+          <div className="brand-title">NX-BOSS</div>
+          <div className="brand-tag">AI</div>
         </div>
-      </nav>
+      </header>
 
-      <main className="main-content">
-        {view === 'home' && (
-          <div className="hero-section">
-            <h1>ИИ-аудит реестра заемщиков</h1>
-            <p>Загрузите Excel файл для автоматической проверки аффилированности</p>
+      <main className="app-main">
+        {view === "home" && (
+          <div className="card">
+            <h2>Загрузка реестра</h2>
+            <p style={{ opacity: 0.8 }}>
+              Загрузите Excel (.xlsx) с колонкой <b>БИН</b> / <b>BIN</b>.
+            </p>
 
-            <form className="search-box" onSubmit={handleAnalyze}>
-              <div className="file-input-wrapper">
-                <input
-                  type="file"
-                  id="file-upload"
-                  accept=".xlsx,.xls"
-                  onChange={(e) => setFile(e.target.files[0])}
-                  required
-                />
-                <label htmlFor="file-upload" className="file-label">
-                  {file ? `✅ ${file.name}` : "Выбрать файл Excel"}
-                </label>
-              </div>
-              <button type="submit" className="analyze-btn" disabled={!file || loading}>
+            <form onSubmit={handleAnalyze} className="form">
+              <input
+                name="file"
+                type="file"
+                accept=".xlsx,.xls"
+                disabled={loading}
+                style={{ marginBottom: 12 }}
+              />
+
+              <button type="submit" disabled={loading} className="btn">
                 {loading ? "Анализируем..." : "Запустить анализ"}
               </button>
             </form>
 
-            <div className="features-grid">
-              <div className="f-card">📊 <span>Авто-скоринг</span></div>
-              <div className="f-card">🕸️ <span>Граф связей</span></div>
-              <div className="f-card">🧠 <span>ИИ объяснение</span></div>
-            </div>
-          </div>
-        )}
-
-        {view === 'scanning' && (
-          <div className="scanning-screen">
-            <div className="scanner-circle"></div>
-            <div className="scanner-text">
-              <h2>{statuses[statusIndex]}</h2>
-              <p>Опрашиваем ГБД ЮЛ и строим граф связей</p>
-            </div>
-            <div className="progress-bar-container">
-              <div className="progress-bar-fill"></div>
-            </div>
-          </div>
-        )}
-
-        {view === 'result' && data && (
-          <div className="result-view">
-            <div className="result-header">
-               <button className="back-btn" onClick={() => { setView('home'); setFile(null); }}>
-                ← Назад к загрузке
-              </button>
-              <div className="quick-stats">
-                <div className="stat-pill">Компаний: <strong>{data.rowsAnalyzed}</strong></div>
-                <div className="stat-pill">Связей: <strong>{data.sharedIINCount}</strong></div>
+            {error && (
+              <div className="error-box" style={{ marginTop: 12 }}>
+                {error}
               </div>
+            )}
+
+            <div style={{ marginTop: 12, fontSize: 12, opacity: 0.7 }}>
+              Если появляется ошибка подключения — проверь, что запущено:
+              <div style={{ marginTop: 6 }}>
+                <code>uvicorn app:app --reload --port 8000</code>
+              </div>
+              и в <code>vite.config.js</code> настроен proxy на <code>http://127.0.0.1:8000</code>.
             </div>
-            <AnalyticsDashboard data={data} />
           </div>
         )}
+
+        {view === "scanning" && (
+          <div className="card">
+            <h2>Подключение к Python API…</h2>
+            <p style={{ opacity: 0.8 }}>
+              Загружаем файл и строим аналитику по всем BIN.
+            </p>
+
+            <div className="loader-wrap" style={{ marginTop: 18 }}>
+              <div className="loader" />
+            </div>
+
+            {error && (
+              <div className="error-box" style={{ marginTop: 12 }}>
+                {error}
+              </div>
+            )}
+          </div>
+        )}
+
+        {view === "result" && <AnalyticsDashboard data={data} />}
       </main>
     </div>
   );
