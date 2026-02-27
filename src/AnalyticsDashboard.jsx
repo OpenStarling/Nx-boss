@@ -1,24 +1,18 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell, Legend
-} from 'recharts';
+  PieChart, Pie, Legend
+} from "recharts";
 
 const AnalyticsDashboard = ({ data }) => {
-  const [selectedCompany, setSelectedCompany] = useState(null);
+  const [selected, setSelected] = useState(null);
 
-  if (!data || data.rowsAnalyzed === 0) {
+  if (!data || !data.results || data.rowsAnalyzed === 0) {
     return (
       <div style={{ padding: 16 }}>
         <div style={{ fontSize: 28 }}>⚠️</div>
         <h3>Данные не распознаны</h3>
-        <p>Система не смогла найти колонку "БИН" в вашем файле.</p>
-        <h4>Как исправить:</h4>
-        <ul>
-          <li>Удалите лишние пустые строки в начале таблицы</li>
-          <li>Убедитесь, что заголовок "БИН" находится в первой строке</li>
-          <li>Проверьте, что БИН содержит 12 цифр</li>
-        </ul>
+        <p>Система не смогла найти колонку БИН/ИИН в вашем файле.</p>
         <button onClick={() => window.location.reload()}>Попробовать другой файл</button>
       </div>
     );
@@ -26,22 +20,30 @@ const AnalyticsDashboard = ({ data }) => {
 
   const results = data.results || [];
   const charts = data.charts || {};
+  const individuals = data.individuals || [];
+  const legalEntities = data.legalEntities || [];
 
   const highCount = useMemo(
-    () => results.filter(r => r.riskLevel === 'HIGH').length,
+    () => results.filter(r => r.riskLevel === "HIGH").length,
     [results]
   );
 
+  const copyList = (items) => {
+    const text = items.map(x => `${x.id}\t${x.name}`).join("\n");
+    navigator.clipboard.writeText(text);
+    alert("Скопировано (ID + Имя). Можно вставлять в Excel.");
+  };
+
   return (
-    <div style={{ padding: 16, display: 'grid', gap: 16 }}>
-      <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
+    <div style={{ padding: 16, display: "grid", gap: 16 }}>
+      <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
         <div><b>Компаний в реестре:</b> {data.rowsAnalyzed}</div>
         <div><b>Выявлено связей:</b> {data.sharedIINCount}</div>
         <div><b>Высокий риск:</b> {highCount}</div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-        <div style={{ minHeight: 260, border: '1px solid #eee', borderRadius: 12, padding: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <div style={{ minHeight: 260, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
           <h4 style={{ marginTop: 0 }}>Распределение по уровню риска</h4>
           <ResponsiveContainer width="100%" height={220}>
             <PieChart>
@@ -52,7 +54,7 @@ const AnalyticsDashboard = ({ data }) => {
           </ResponsiveContainer>
         </div>
 
-        <div style={{ minHeight: 260, border: '1px solid #eee', borderRadius: 12, padding: 12 }}>
+        <div style={{ minHeight: 260, border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
           <h4 style={{ marginTop: 0 }}>Гистограмма скоринга</h4>
           <ResponsiveContainer width="100%" height={220}>
             <BarChart data={charts.scoreHistogram || []}>
@@ -65,14 +67,66 @@ const AnalyticsDashboard = ({ data }) => {
         </div>
       </div>
 
-      <div style={{ border: '1px solid #eee', borderRadius: 12, padding: 12 }}>
+      {/* Быстрые списки для фин.отдела */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+        <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+            <h4 style={{ margin: 0 }}>Физические лица (ИИН)</h4>
+            <button onClick={() => copyList(individuals)}>Скопировать</button>
+          </div>
+          <div style={{ maxHeight: 220, overflow: "auto", marginTop: 8 }}>
+            <table width="100%" cellPadding="8" style={{ borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ textAlign: "left", borderBottom: "1px solid #eee" }}>
+                  <th>ИИН</th><th>ФИО</th>
+                </tr>
+              </thead>
+              <tbody>
+                {individuals.map((x, i) => (
+                  <tr key={i} style={{ borderBottom: "1px solid #f3f3f3" }}>
+                    <td>{x.id}</td>
+                    <td>{x.name}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "center" }}>
+            <h4 style={{ margin: 0 }}>Юридические лица (БИН)</h4>
+            <button onClick={() => copyList(legalEntities)}>Скопировать</button>
+          </div>
+          <div style={{ maxHeight: 220, overflow: "auto", marginTop: 8 }}>
+            <table width="100%" cellPadding="8" style={{ borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ textAlign: "left", borderBottom: "1px solid #eee" }}>
+                  <th>БИН</th><th>Наименование</th>
+                </tr>
+              </thead>
+              <tbody>
+                {legalEntities.map((x, i) => (
+                  <tr key={i} style={{ borderBottom: "1px solid #f3f3f3" }}>
+                    <td>{x.id}</td>
+                    <td>{x.name}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      {/* Реестр общий */}
+      <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
         <h4 style={{ marginTop: 0 }}>Реестр</h4>
-        <div style={{ maxHeight: 320, overflow: 'auto' }}>
-          <table width="100%" cellPadding="8" style={{ borderCollapse: 'collapse' }}>
+        <div style={{ maxHeight: 320, overflow: "auto" }}>
+          <table width="100%" cellPadding="8" style={{ borderCollapse: "collapse" }}>
             <thead>
-              <tr style={{ textAlign: 'left', borderBottom: '1px solid #eee' }}>
+              <tr style={{ textAlign: "left", borderBottom: "1px solid #eee" }}>
                 <th>БИН/ИИН</th>
-                <th>Наименование</th>
+                <th>Имя/Наименование</th>
                 <th>Скоринг</th>
                 <th>Уровень</th>
                 <th></th>
@@ -80,15 +134,13 @@ const AnalyticsDashboard = ({ data }) => {
             </thead>
             <tbody>
               {results.map((item, idx) => (
-                <tr key={idx} style={{ borderBottom: '1px solid #f3f3f3' }}>
-                  <td>{item.bin}</td>
-                  <td>{item.name}</td>
+                <tr key={idx} style={{ borderBottom: "1px solid #f3f3f3" }}>
+                  <td>{item.id}</td>
+                  <td>{item.displayName}</td>
                   <td>{item.riskScore}%</td>
                   <td>{item.riskLevel}</td>
                   <td>
-                    <button onClick={() => setSelectedCompany(item)}>
-                      ℹ️
-                    </button>
+                    <button onClick={() => setSelected(item)}>ℹ️</button>
                   </td>
                 </tr>
               ))}
@@ -97,22 +149,24 @@ const AnalyticsDashboard = ({ data }) => {
         </div>
       </div>
 
-      <div style={{ border: '1px solid #eee', borderRadius: 12, padding: 12 }}>
-        {selectedCompany ? (
+      {/* Детали */}
+      <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+        {selected ? (
           <>
-            <h4 style={{ marginTop: 0 }}>{selectedCompany.name}</h4>
+            <h4 style={{ marginTop: 0 }}>{selected.displayName}</h4>
             <div style={{ marginBottom: 8 }}>
-              <b>BIN:</b> {selectedCompany.bin} &nbsp; | &nbsp;
-              <b>Risk:</b> {selectedCompany.riskScore}% ({selectedCompany.riskLevel})
+              <b>ID:</b> {selected.id} &nbsp; | &nbsp;
+              <b>Тип:</b> {selected.entityType} &nbsp; | &nbsp;
+              <b>Risk:</b> {selected.riskScore}% ({selected.riskLevel})
             </div>
             <ul>
-              {(selectedCompany.reasons || ["Причины не указаны."]).map((r, i) => (
+              {(selected.reasons || ["Причины не указаны."]).map((r, i) => (
                 <li key={i}>{r}</li>
               ))}
             </ul>
           </>
         ) : (
-          <div>Выберите компанию для анализа</div>
+          <div>Выберите строку для просмотра деталей</div>
         )}
       </div>
     </div>

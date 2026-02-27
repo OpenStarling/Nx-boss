@@ -25,39 +25,25 @@ function App() {
       const formData = new FormData();
       formData.append("file", file);
 
-      // ВАЖНО: относительный путь, работает через Vite proxy -> http://127.0.0.1:8000
-      const response = await fetch("/api/analyze", {
-        method: "POST",
-        body: formData,
-      });
+      const response = await fetch("/api/analyze", { method: "POST", body: formData });
+
+      // читаем body ОДИН раз
+      const raw = await response.text();
+      let payload = null;
+      try { payload = raw ? JSON.parse(raw) : null; } catch {}
 
       if (!response.ok) {
-        // попробуем прочитать текст/JSON ошибки
-        let detail = "";
-        try {
-          const maybeJson = await response.json();
-          detail = maybeJson?.detail ? String(maybeJson.detail) : JSON.stringify(maybeJson);
-        } catch {
-          detail = await response.text();
-        }
-        throw new Error(detail || `HTTP ${response.status}`);
+        const detail = (payload && (payload.detail || payload.message)) || raw || `HTTP ${response.status}`;
+        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
       }
 
-      const result = await response.json();
+      if (!payload) throw new Error("Сервер вернул пустой ответ.");
 
-      setData(result);
+      setData(payload);
       setView("result");
     } catch (err) {
       console.error(err);
-
-      // дружелюбная ошибка для пользователя
-      const msg = String(err?.message || "");
-      setError(
-        msg.includes("Failed to fetch")
-          ? "Не удалось подключиться к серверу. Убедись, что Python-бэкенд запущен (uvicorn на 8000) и Vite proxy настроен."
-          : `Ошибка сервера: ${msg}`
-      );
-
+      setError(`Ошибка сервера: ${String(err?.message || err)}`);
       setView("home");
       setData(null);
     } finally {
@@ -67,67 +53,32 @@ function App() {
 
   return (
     <div className="app">
-      <header className="app-header">
-        <div className="brand">
-          <div className="brand-title">NX-BOSS</div>
-          <div className="brand-tag">AI</div>
-        </div>
-      </header>
-
       <main className="app-main">
         {view === "home" && (
           <div className="card">
             <h2>Загрузка реестра</h2>
-            <p style={{ opacity: 0.8 }}>
-              Загрузите Excel (.xlsx) с колонкой <b>БИН</b> / <b>BIN</b>.
-            </p>
+            <p style={{ opacity: 0.8 }}>Загрузите Excel (.xlsx) с колонкой БИН/ИИН.</p>
 
             <form onSubmit={handleAnalyze} className="form">
-              <input
-                name="file"
-                type="file"
-                accept=".xlsx,.xls"
-                disabled={loading}
-                style={{ marginBottom: 12 }}
-              />
-
+              <input name="file" type="file" accept=".xlsx,.xls" disabled={loading} />
               <button type="submit" disabled={loading} className="btn">
                 {loading ? "Анализируем..." : "Запустить анализ"}
               </button>
             </form>
 
-            {error && (
-              <div className="error-box" style={{ marginTop: 12 }}>
-                {error}
-              </div>
-            )}
-
-            <div style={{ marginTop: 12, fontSize: 12, opacity: 0.7 }}>
-              Если появляется ошибка подключения — проверь, что запущено:
-              <div style={{ marginTop: 6 }}>
-                <code>uvicorn app:app --reload --port 8000</code>
-              </div>
-              и в <code>vite.config.js</code> настроен proxy на <code>http://127.0.0.1:8000</code>.
-            </div>
+            {error && <div className="error-box" style={{ marginTop: 12 }}>{error}</div>}
           </div>
         )}
 
         {view === "scanning" && (
           <div className="card">
-            <h2>Подключение к Python API…</h2>
+            <h2>Получаем имена через API…</h2>
             <p style={{ opacity: 0.8 }}>
-              Загружаем файл и строим аналитику по всем BIN.
+              Если файл большой — первый раз может быть дольше. Повторно будет быстрее (кеш).
             </p>
-
             <div className="loader-wrap" style={{ marginTop: 18 }}>
               <div className="loader" />
             </div>
-
-            {error && (
-              <div className="error-box" style={{ marginTop: 12 }}>
-                {error}
-              </div>
-            )}
           </div>
         )}
 

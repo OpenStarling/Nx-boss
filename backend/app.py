@@ -3,6 +3,9 @@ from __future__ import annotations
 import io
 import os
 import re
+import json
+import asyncio
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter
 
@@ -11,37 +14,203 @@ import httpx
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
+# =========================
+# Settings
+# =========================
+USE_LLM = False  # для скорости выключено (и не нужно для задачи "имена")
 
-# -----------------------------
-# Helpers: BIN parsing & scoring
-# -----------------------------
+GBDUL_URL = os.getenv("GBDUL_URL", "").strip()           # ваш API lookup
+GBDUL_TOKEN = os.getenv("GBDUL_TOKEN", "").strip()       # опционально
+GBDUL_CONCURRENCY = int(os.getenv("GBDUL_CONCURRENCY", "25"))
 
-BIN_WORD_RE = re.compile(r"\b(бин|bin)\b", re.IGNORECASE)
-NAME_WORD_RE = re.compile(r"\b(наименование|name|company|организац)\b", re.IGNORECASE)
+CACHE_PATH = Path("cache_names.json")  # id -> name
 
 
-def _norm_cell(x: Any) -> str:
-    return re.sub(r"\s+", " ", str(x or "")).strip().lower()
+# =========================
+# Utils
+# =========================
+BIN_WORD_RE = re.compile(r"(?:^|\b)(бин|bin|иин|iin)(?:\b|$)", re.IGNORECASE)
 
+def _norm(x: Any) -> str:
+    return re.sub(r"\s+", " ", str(x or "")).strip()
+
+def _norm_low(x: Any) -> str:
+    return _norm(x).lower()
+
+def _is_nan(x: Any) -> bool:
+    try:
+        return pd.isna(x)
+    except Exception:
+        return False
 
 def to12(v: Any) -> Optional[str]:
-    """Convert value to 12-digit BIN-like string."""
-    if v is None:
-        return None
-    s = str(v).strip()
-    digits = re.sub(r"\D", "", s)
+    digits = re.sub(r"\D", "", str(v or ""))
     if not digits:
         return None
     return digits[-12:].rjust(12, "0")
 
+def infer_entity_type(id12: str) -> str:
+    """
+    Быстрая эвристика:
+    если первые 6 цифр похожи на дату и 7-я 1..6 -> ИИН (INDIVIDUAL)
+    иначе -> БИН (LEGAL)
+    """
+    if not id12 or len(id12) != 12:
+        return "UNKNOWN"
+    try:
+        mm = int(id12[2:4])
+        dd = int(id12[4:6])
+        s = id12[6]
+        if 1 <= mm <= 12 and 1 <= dd <= 31 and s in "123456":
+            return "INDIVIDUAL"
+        return "LEGAL"
+    except Exception:
+        return "UNKNOWN"
 
+
+# =========================
+# Excel parsing (robust header detection)
+# =========================
+def parse_excel_auto_header(content: bytes, scan_rows: int = 30) -> pd.DataFrame:
+    """
+    Реестр может иметь заголовок не в 1-й строке.
+    Ищем строку где встречается БИН/ИИН/BIN/IIN и ставим её как header.
+    """
+    raw = pd.read_excel(io.BytesIO(content), header=None)
+
+    header_row = None
+    for r in range(min(scan_rows, len(raw))):
+        row_vals = [_norm_low(v) for v in raw.iloc[r].tolist()]
+        if any(BIN_WORD_RE.search(v) for v in row_vals):
+            header_row = r
+            break
+
+    if header_row is None:
+        df = pd.read_excel(io.BytesIO(content))
+        df.columns = [_norm_low(c) for c in df.columns]
+        return df
+
+    headers = [_norm_low(v) for v in raw.iloc[header_row].tolist()]
+    headers = [h if h else f"col_{i}" for i, h in enumerate(headers)]
+
+    df = raw.iloc[header_row + 1:].copy()
+    df.columns = headers
+    df = df.dropna(how="all")
+    return df
+
+def find_id_col(df: pd.DataFrame) -> Optional[str]:
+    # 1) по заголовку
+    for c in df.columns:
+        cc = _norm_low(c)
+        if "бин" in cc or "bin" in cc or "иин" in cc or "iin" in cc:
+            return c
+
+    # 2) fallback по содержимому (много 12-значных)
+    best_col, best_ratio = None, 0.0
+    for c in df.columns:
+        ser = df[c].dropna()
+        if len(ser) < 5:
+            continue
+        sample = ser.head(500)
+        ok = 0
+        for v in sample:
+            d = re.sub(r"\D", "", str(v or ""))
+            if len(d) == 12:
+                ok += 1
+        ratio = ok / max(1, len(sample))
+        if ratio > best_ratio:
+            best_ratio, best_col = ratio, c
+
+    return best_col if best_ratio >= 0.5 else None
+
+
+# =========================
+# Cache
+# =========================
+def load_cache() -> Dict[str, str]:
+    if CACHE_PATH.exists():
+        try:
+            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_cache(cache: Dict[str, str]) -> None:
+    try:
+        CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# =========================
+# GBDUL lookup (name by BIN/IIN)
+# =========================
+async def gbdul_lookup_name(id12: str) -> Optional[str]:
+    """
+    Ожидаем ваш API:
+      POST GBDUL_URL
+      body: {"id": "12digits"}  (если у вас другой ключ — поменяйте здесь)
+      response: JSON с одним из ключей:
+        name/fullName/full_name/fio/companyName/title/naimenovanie
+      или внутри data/result/payload.
+    """
+    if not GBDUL_URL:
+        return None
+
+    headers = {}
+    if GBDUL_TOKEN:
+        headers["Authorization"] = f"Bearer {GBDUL_TOKEN}"
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            r = await client.post(GBDUL_URL, json={"id": id12}, headers=headers)
+            r.raise_for_status()
+            j = r.json()
+
+        def pick(d: dict) -> Optional[str]:
+            for k in ["name", "fullName", "full_name", "fio", "companyName", "company_name", "title", "naimenovanie"]:
+                if k in d and d[k]:
+                    return str(d[k]).strip()
+            return None
+
+        name = pick(j)
+        if name:
+            return name
+
+        for box in ["data", "result", "payload"]:
+            if box in j and isinstance(j[box], dict):
+                name2 = pick(j[box])
+                if name2:
+                    return name2
+
+        return None
+    except Exception:
+        return None
+
+
+async def batch_lookup(ids: List[str], concurrency: int) -> Dict[str, str]:
+    sem = asyncio.Semaphore(max(1, concurrency))
+    out: Dict[str, str] = {}
+
+    async def one(x: str):
+        async with sem:
+            nm = await gbdul_lookup_name(x)
+            if nm:
+                out[x] = nm
+
+    await asyncio.gather(*(one(i) for i in ids))
+    return out
+
+
+# =========================
+# Charts
+# =========================
 def level_from_score(score: int) -> str:
     if score >= 70:
         return "HIGH"
     if score >= 40:
         return "MEDIUM"
     return "LOW"
-
 
 def bucket_score(score: int, step: int = 10) -> str:
     score = max(0, min(100, int(score)))
@@ -51,162 +220,17 @@ def bucket_score(score: int, step: int = 10) -> str:
         return "100"
     return f"{lo}-{hi}"
 
-
-def heuristic_score(bin12: str) -> Tuple[int, List[str]]:
-    """
-    Базовая эвристика (чтобы всегда был результат).
-    Потом замените на вашу формулу/модель/правила.
-    """
+def heuristic_score(id12: str) -> Tuple[int, List[str]]:
+    # быстрый скоринг-заглушка (можно убрать/заменить)
     reasons: List[str] = []
-    tail = int(bin12[-2:])
-    score = 25
-
-    if tail in {0, 1, 2, 3, 4}:
-        score += 25
-        reasons.append("Условный признак: аномальная структура идентификатора (окончание 00–04).")
-
-    if bin12.startswith("0"):
-        score += 15
-        reasons.append("BIN начинается с 0 (возможная некорректная запись/формат).")
-
-    # небольшой детерминированный “шум”
-    score += (int(bin12[-1]) * 3) % 20
-
+    score = 50 + (int(id12[-1]) * 3) % 30
     score = max(0, min(100, score))
-    if not reasons:
-        reasons.append("Явных риск-факторов по базовой эвристике не выявлено.")
+    reasons.append("Скоринг демо-режим (для хакатона).")
     return score, reasons
-
-
-async def ollama_score(bin12: str) -> Optional[Tuple[int, str, str, int]]:
-    """
-    Опционально: Ollama JSON score.
-    Возвращает (score, risk_level, reason, big_biz_chance) либо None.
-    """
-    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
-    model = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
-
-    prompt = (
-        f"Проанализируй БИН {bin12}. "
-        "Верни строго JSON без пояснений: "
-        '{"score": 0-100, "risk_level":"LOW|MEDIUM|HIGH", '
-        '"reason":"кратко", "big_biz_chance":0-100}'
-    )
-
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                ollama_url,
-                json={"model": model, "prompt": prompt, "stream": False, "format": "json"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        raw = (data.get("response") or "").strip()
-
-        # убрать возможный <think>...</think>
-        raw = re.sub(r"<think>[\s\S]*?</think>", "", raw).strip()
-
-        # вытащить первый JSON-объект
-        m = re.search(r"\{[\s\S]*\}", raw)
-        if not m:
-            return None
-
-        j = httpx.Response(200, content=m.group(0)).json()
-
-        score = int(j.get("score", 0))
-        risk_level = str(j.get("risk_level", "")).upper() or level_from_score(score)
-        reason = str(j.get("reason", "")).strip() or "Причина не указана."
-        big_biz = int(j.get("big_biz_chance", 0))
-
-        score = max(0, min(100, score))
-        if risk_level not in {"LOW", "MEDIUM", "HIGH"}:
-            risk_level = level_from_score(score)
-        big_biz = max(0, min(100, big_biz))
-
-        return score, risk_level, reason, big_biz
-    except Exception:
-        return None
-
-
-# -----------------------------
-# Excel parsing: robust header detection
-# -----------------------------
-
-def parse_excel_find_bin_and_name(bytes_content: bytes, scan_rows: int = 30) -> Tuple[pd.DataFrame, str, Optional[str]]:
-    """
-    1) Читаем лист с header=None
-    2) Ищем строку заголовков, где встречается слово БИН/BIN (ваш кейс)
-    3) Ставим эту строку как header
-    4) Находим колонку BIN по вхождению "бин"/"bin"
-    5) Находим колонку name по вхождению "наименование"/"name"/...
-    """
-    raw = pd.read_excel(io.BytesIO(bytes_content), header=None)
-
-    # попытка найти строку заголовков
-    header_row_idx: Optional[int] = None
-    for r in range(min(scan_rows, len(raw))):
-        row_vals = [_norm_cell(v) for v in raw.iloc[r].tolist()]
-        if any(BIN_WORD_RE.search(v) for v in row_vals):
-            header_row_idx = r
-            break
-
-    if header_row_idx is None:
-        # fallback: считаем, что заголовок в первой строке
-        df = pd.read_excel(io.BytesIO(bytes_content))
-        df.columns = [_norm_cell(c) for c in df.columns]
-        bin_col = None
-        for c in df.columns:
-            if "бин" in c or "bin" in c:
-                bin_col = c
-                break
-        if not bin_col:
-            raise ValueError("BIN column not found")
-        name_col = None
-        for c in df.columns:
-            if NAME_WORD_RE.search(c):
-                name_col = c
-                break
-        return df, bin_col, name_col
-
-    # ставим header из найденной строки
-    header_vals = [_norm_cell(v) for v in raw.iloc[header_row_idx].tolist()]
-    cols = [v if v else f"col_{i}" for i, v in enumerate(header_vals)]
-
-    df = raw.iloc[header_row_idx + 1 :].copy()
-    df.columns = cols
-
-    # убрать полностью пустые строки
-    df = df.dropna(how="all")
-
-    # найти BIN колонку
-    bin_col = None
-    for c in df.columns:
-        cc = _norm_cell(c)
-        if "бин" in cc or "bin" in cc:
-            bin_col = c
-            break
-    if not bin_col:
-        raise ValueError("BIN column not found")
-
-    # найти name колонку
-    name_col = None
-    for c in df.columns:
-        cc = _norm_cell(c)
-        if NAME_WORD_RE.search(cc):
-            name_col = c
-            break
-
-    return df, bin_col, name_col
-
-
-# -----------------------------
-# Charts builder
-# -----------------------------
 
 def build_charts(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     level_counts = Counter([r.get("riskLevel") for r in results])
-    risk_level_counts = [
+    riskLevelCounts = [
         {"name": "LOW", "value": int(level_counts.get("LOW", 0))},
         {"name": "MEDIUM", "value": int(level_counts.get("MEDIUM", 0))},
         {"name": "HIGH", "value": int(level_counts.get("HIGH", 0))},
@@ -214,23 +238,16 @@ def build_charts(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     hist = Counter([bucket_score(int(r.get("riskScore", 0))) for r in results])
     order = [f"{i}-{i+10}" for i in range(0, 100, 10)] + ["100"]
-    score_histogram = [{"bucket": k, "count": int(hist.get(k, 0))} for k in order]
+    scoreHistogram = [{"bucket": k, "count": int(hist.get(k, 0))} for k in order]
 
-    top_risk = sorted(results, key=lambda x: int(x.get("riskScore", 0)), reverse=True)[:10]
-
-    return {
-        "riskLevelCounts": risk_level_counts,
-        "scoreHistogram": score_histogram,
-        "topRisk": top_risk,
-    }
+    topRisk = sorted(results, key=lambda x: int(x.get("riskScore", 0)), reverse=True)[:10]
+    return {"riskLevelCounts": riskLevelCounts, "scoreHistogram": scoreHistogram, "topRisk": topRisk}
 
 
-# -----------------------------
-# FastAPI app
-# -----------------------------
-
-app = FastAPI(title="NX-BOSS Python Backend", version="1.1.0")
-
+# =========================
+# FastAPI
+# =========================
+app = FastAPI(title="NX-BOSS Backend", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -239,54 +256,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/api/health")
 async def health():
     return {"ok": True}
-
 
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...)):
     content = await file.read()
 
-    try:
-        df, bin_col, name_col = parse_excel_find_bin_and_name(content, scan_rows=30)
-    except Exception:
-        return {"rowsAnalyzed": 0, "results": [], "sharedIINCount": 0, "charts": {}}
+    df = parse_excel_auto_header(content, scan_rows=30)
+    df.columns = [_norm_low(c) for c in df.columns]
 
+    id_col = find_id_col(df)
+    if not id_col:
+        return {
+            "rowsAnalyzed": 0,
+            "results": [],
+            "sharedIINCount": 0,
+            "charts": {},
+            "individuals": [],
+            "legalEntities": [],
+        }
+
+    # 1) собрать уникальные ID (чтобы не дергать API по 100 раз одинаковое)
+    unique_ids = sorted({to12(v) for v in df[id_col].tolist() if to12(v)})
+
+    # 2) кеш + догрузка missing параллельно
+    cache = load_cache()
+    missing = [i for i in unique_ids if i not in cache]
+
+    if missing:
+        fetched = await batch_lookup(missing, concurrency=GBDUL_CONCURRENCY)
+        cache.update(fetched)
+        save_cache(cache)
+
+    names_map = cache
+
+    # 3) собрать results
     results: List[Dict[str, Any]] = []
+    individuals: Dict[str, str] = {}
+    legal_entities: Dict[str, str] = {}
 
-    for _, row in df.iterrows():
-        bin12 = to12(row.get(bin_col))
-        if not bin12:
+    for v in df[id_col].tolist():
+        id12 = to12(v)
+        if not id12:
             continue
 
-        name = None
-        if name_col:
-            v = row.get(name_col)
-            if v is not None and str(v).strip():
-                name = str(v).strip()
+        entityType = infer_entity_type(id12)
+        name = names_map.get(id12)  # имя из API/кеша
+        if not name:
+            name = ("ФЛ " if entityType == "INDIVIDUAL" else "ЮЛ ") + id12
 
-        # 1) пробуем Ollama (если доступен), 2) иначе эвристика
-        llm = await ollama_score(bin12)
-        if llm:
-            score, risk_level, reason, big_biz = llm
-            reasons = [reason]
-        else:
-            score, reasons = heuristic_score(bin12)
-            risk_level = level_from_score(score)
-            big_biz = int(min(100, max(0, score + 10)))
+        score, reasons = heuristic_score(id12)
+        riskLevel = level_from_score(score)
 
-        results.append(
-            {
-                "bin": bin12,
-                "name": name or f"BIN {bin12}",
-                "riskScore": int(score),
-                "riskLevel": risk_level,
-                "bigBizChance": int(big_biz),
-                "reasons": reasons,
-            }
-        )
+        results.append({
+            "id": id12,
+            "entityType": entityType,     # INDIVIDUAL | LEGAL
+            "displayName": name,          # главное поле для фин.отдела
+            "riskScore": int(score),
+            "riskLevel": riskLevel,
+            "reasons": reasons,
+        })
+
+        if entityType == "INDIVIDUAL":
+            individuals[id12] = name
+        elif entityType == "LEGAL":
+            legal_entities[id12] = name
 
     charts = build_charts(results)
 
@@ -295,4 +331,6 @@ async def analyze(file: UploadFile = File(...)):
         "results": results,
         "sharedIINCount": 0,
         "charts": charts,
+        "individuals": [{"id": k, "name": v} for k, v in individuals.items()],
+        "legalEntities": [{"id": k, "name": v} for k, v in legal_entities.items()],
     }
