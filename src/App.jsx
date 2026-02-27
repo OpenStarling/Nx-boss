@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import "./App.css";
 import AnalyticsDashboard from "./AnalyticsDashboard";
+import "leaflet/dist/leaflet.css";
 
 function App() {
   const [loading, setLoading] = useState(false);

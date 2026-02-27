@@ -14,15 +14,19 @@ import httpx
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
-# =========================
-# Settings
-# =========================
-USE_LLM = False  # для скорости выключено (и не нужно для задачи "имена")
 
-GBDUL_URL = os.getenv("GBDUL_URL", "").strip()           # ваш API lookup
-GBDUL_TOKEN = os.getenv("GBDUL_TOKEN", "").strip()       # опционально
+# =========================
+# ENV (ВАЖНО)
+# =========================
+# ЮЛ (БИН) — точно есть у вас в репо
+GBDUL_BIN_URL = os.getenv("GBDUL_BIN_URL", "").strip()     # пример: http://192.168.0.31:8830/gbdulbybin/send-request
+# ФЛ (ИИН) — возможно есть другой endpoint. Если нет — оставьте пустым.
+GBDUL_IIN_URL = os.getenv("GBDUL_IIN_URL", "").strip()     # пример: http://192.168.0.31:8830/gbdulbyiin/send-request
+
+GBDUL_REQUESTOR_BIN = os.getenv("GBDUL_REQUESTOR_BIN", "970840000277").strip()
+GBDUL_AUTH_BASIC = os.getenv("GBDUL_BASIC", "").strip()    # пример: Basic xxxxxxx (base64 login:password)
+
 GBDUL_CONCURRENCY = int(os.getenv("GBDUL_CONCURRENCY", "25"))
-
 CACHE_PATH = Path("cache_names.json")  # id -> name
 
 
@@ -37,12 +41,6 @@ def _norm(x: Any) -> str:
 def _norm_low(x: Any) -> str:
     return _norm(x).lower()
 
-def _is_nan(x: Any) -> bool:
-    try:
-        return pd.isna(x)
-    except Exception:
-        return False
-
 def to12(v: Any) -> Optional[str]:
     digits = re.sub(r"\D", "", str(v or ""))
     if not digits:
@@ -51,9 +49,8 @@ def to12(v: Any) -> Optional[str]:
 
 def infer_entity_type(id12: str) -> str:
     """
-    Быстрая эвристика:
-    если первые 6 цифр похожи на дату и 7-я 1..6 -> ИИН (INDIVIDUAL)
-    иначе -> БИН (LEGAL)
+    Эвристика: если первые 6 цифр похожи на дату и 7-я 1..6 -> ИИН
+    иначе -> БИН
     """
     if not id12 or len(id12) != 12:
         return "UNKNOWN"
@@ -69,13 +66,9 @@ def infer_entity_type(id12: str) -> str:
 
 
 # =========================
-# Excel parsing (robust header detection)
+# Excel parsing (robust header)
 # =========================
 def parse_excel_auto_header(content: bytes, scan_rows: int = 30) -> pd.DataFrame:
-    """
-    Реестр может иметь заголовок не в 1-й строке.
-    Ищем строку где встречается БИН/ИИН/BIN/IIN и ставим её как header.
-    """
     raw = pd.read_excel(io.BytesIO(content), header=None)
 
     header_row = None
@@ -99,13 +92,12 @@ def parse_excel_auto_header(content: bytes, scan_rows: int = 30) -> pd.DataFrame
     return df
 
 def find_id_col(df: pd.DataFrame) -> Optional[str]:
-    # 1) по заголовку
     for c in df.columns:
         cc = _norm_low(c)
         if "бин" in cc or "bin" in cc or "иин" in cc or "iin" in cc:
             return c
 
-    # 2) fallback по содержимому (много 12-значных)
+    # fallback by values
     best_col, best_ratio = None, 0.0
     for c in df.columns:
         ser = df[c].dropna()
@@ -143,47 +135,92 @@ def save_cache(cache: Dict[str, str]) -> None:
 
 
 # =========================
-# GBDUL lookup (name by BIN/IIN)
+# GBDUL API parsing (важно!)
 # =========================
-async def gbdul_lookup_name(id12: str) -> Optional[str]:
+def _pick_first(d: dict, keys: List[str]) -> Optional[str]:
+    for k in keys:
+        v = d.get(k)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+def parse_legal_name_from_gbdul(j: dict) -> Optional[str]:
     """
-    Ожидаем ваш API:
-      POST GBDUL_URL
-      body: {"id": "12digits"}  (если у вас другой ключ — поменяйте здесь)
-      response: JSON с одним из ключей:
-        name/fullName/full_name/fio/companyName/title/naimenovanie
-      или внутри data/result/payload.
+    По вашей Node-логике основной кейс:
+    data.organization.fullNameRu
     """
-    if not GBDUL_URL:
+    data = j.get("data") or {}
+    org = data.get("organization") or {}
+    return _pick_first(org, ["fullNameRu", "fullNameKz", "fullNameEn", "nameRu", "nameKz", "nameEn", "name", "title"])
+
+def parse_person_name_from_gbdul(j: dict) -> Optional[str]:
+    """
+    ФЛ: формат может отличаться. Пробуем типовые варианты.
+    """
+    data = j.get("data") or {}
+
+    # 1) часто бывает data.person
+    person = data.get("person") or {}
+    nm = _pick_first(person, ["fullNameRu", "fullNameKz", "fullNameEn", "fio", "fullName", "name"])
+    if nm:
+        return nm
+
+    # 2) иногда бывает data.individual / data.human
+    for key in ["individual", "human", "client"]:
+        box = data.get(key)
+        if isinstance(box, dict):
+            nm2 = _pick_first(box, ["fullNameRu", "fio", "fullName", "name"])
+            if nm2:
+                return nm2
+
+    # 3) или прямо на верхнем уровне
+    nm3 = _pick_first(j, ["fio", "fullName", "full_name", "name"])
+    return nm3
+
+
+# =========================
+# GBDUL requests (как в Node)
+# =========================
+def _auth_headers() -> Dict[str, str]:
+    h = {"Content-Type": "application/json"}
+    if GBDUL_AUTH_BASIC:
+        h["Authorization"] = GBDUL_AUTH_BASIC
+    return h
+
+async def gbdul_lookup_legal(bin12: str) -> Optional[str]:
+    if not GBDUL_BIN_URL:
         return None
-
-    headers = {}
-    if GBDUL_TOKEN:
-        headers["Authorization"] = f"Bearer {GBDUL_TOKEN}"
-
     try:
-        async with httpx.AsyncClient(timeout=12.0) as client:
-            r = await client.post(GBDUL_URL, json={"id": id12}, headers=headers)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                GBDUL_BIN_URL,
+                json={"bin": bin12, "requestor_bin": GBDUL_REQUESTOR_BIN},
+                headers=_auth_headers(),
+            )
             r.raise_for_status()
             j = r.json()
-
-        def pick(d: dict) -> Optional[str]:
-            for k in ["name", "fullName", "full_name", "fio", "companyName", "company_name", "title", "naimenovanie"]:
-                if k in d and d[k]:
-                    return str(d[k]).strip()
-            return None
-
-        name = pick(j)
-        if name:
-            return name
-
-        for box in ["data", "result", "payload"]:
-            if box in j and isinstance(j[box], dict):
-                name2 = pick(j[box])
-                if name2:
-                    return name2
-
+        return parse_legal_name_from_gbdul(j)
+    except Exception:
         return None
+
+async def gbdul_lookup_person(iin12: str) -> Optional[str]:
+    """
+    Работает ТОЛЬКО если вы укажете GBDUL_IIN_URL.
+    ВНИМАНИЕ: тело запроса может быть другим — если ваш endpoint ждёт {"iin": ...},
+    поменяйте json ниже.
+    """
+    if not GBDUL_IIN_URL:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                GBDUL_IIN_URL,
+                json={"iin": iin12, "requestor_bin": GBDUL_REQUESTOR_BIN},
+                headers=_auth_headers(),
+            )
+            r.raise_for_status()
+            j = r.json()
+        return parse_person_name_from_gbdul(j)
     except Exception:
         return None
 
@@ -194,7 +231,11 @@ async def batch_lookup(ids: List[str], concurrency: int) -> Dict[str, str]:
 
     async def one(x: str):
         async with sem:
-            nm = await gbdul_lookup_name(x)
+            typ = infer_entity_type(x)
+            if typ == "LEGAL":
+                nm = await gbdul_lookup_legal(x)
+            else:
+                nm = await gbdul_lookup_person(x)
             if nm:
                 out[x] = nm
 
@@ -203,7 +244,7 @@ async def batch_lookup(ids: List[str], concurrency: int) -> Dict[str, str]:
 
 
 # =========================
-# Charts
+# Charts (быстро, без LLM)
 # =========================
 def level_from_score(score: int) -> str:
     if score >= 70:
@@ -221,12 +262,10 @@ def bucket_score(score: int, step: int = 10) -> str:
     return f"{lo}-{hi}"
 
 def heuristic_score(id12: str) -> Tuple[int, List[str]]:
-    # быстрый скоринг-заглушка (можно убрать/заменить)
-    reasons: List[str] = []
+    # быстрый демо-скоринг (не влияет на имена)
     score = 50 + (int(id12[-1]) * 3) % 30
     score = max(0, min(100, score))
-    reasons.append("Скоринг демо-режим (для хакатона).")
-    return score, reasons
+    return score, ["Скоринг демо-режим."]
 
 def build_charts(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     level_counts = Counter([r.get("riskLevel") for r in results])
@@ -247,7 +286,7 @@ def build_charts(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 # =========================
 # FastAPI
 # =========================
-app = FastAPI(title="NX-BOSS Backend", version="3.0.0")
+app = FastAPI(title="NX-BOSS Backend", version="4.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -278,10 +317,10 @@ async def analyze(file: UploadFile = File(...)):
             "legalEntities": [],
         }
 
-    # 1) собрать уникальные ID (чтобы не дергать API по 100 раз одинаковое)
+    # уникальные ID
     unique_ids = sorted({to12(v) for v in df[id_col].tolist() if to12(v)})
 
-    # 2) кеш + догрузка missing параллельно
+    # cache + fetch missing
     cache = load_cache()
     missing = [i for i in unique_ids if i not in cache]
 
@@ -292,7 +331,6 @@ async def analyze(file: UploadFile = File(...)):
 
     names_map = cache
 
-    # 3) собрать results
     results: List[Dict[str, Any]] = []
     individuals: Dict[str, str] = {}
     legal_entities: Dict[str, str] = {}
@@ -303,7 +341,9 @@ async def analyze(file: UploadFile = File(...)):
             continue
 
         entityType = infer_entity_type(id12)
-        name = names_map.get(id12)  # имя из API/кеша
+        name = names_map.get(id12)
+
+        # fallback, если API не вернул имя (или нет IIN endpoint)
         if not name:
             name = ("ФЛ " if entityType == "INDIVIDUAL" else "ЮЛ ") + id12
 
@@ -313,7 +353,7 @@ async def analyze(file: UploadFile = File(...)):
         results.append({
             "id": id12,
             "entityType": entityType,     # INDIVIDUAL | LEGAL
-            "displayName": name,          # главное поле для фин.отдела
+            "displayName": name,          # реальное имя/наименование
             "riskScore": int(score),
             "riskLevel": riskLevel,
             "reasons": reasons,
