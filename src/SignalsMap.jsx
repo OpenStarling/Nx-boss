@@ -1,5 +1,4 @@
-import React, { useEffect, useState } from "react";
-import { MapPin } from "lucide-react";
+import React from "react";
 import mapImage from "./kz.svg"; 
 
 const REGION_POSITIONS = {
@@ -17,106 +16,113 @@ const REGION_POSITIONS = {
   "Кызылординская область": { top: "68%", left: "42%" },
   "Туркестанская область": { top: "83%", left: "48%" },
   "город Шымкент": { top: "86%", left: "52%" },
-  "Жамбылская область": { top: "82%", left: "60%" },
-  "Алматинская область": { top: "75%", left: "75%" },
-  "город Алматы": { top: "82%", left: "75%" },
-  "область Жетісу": { top: "65%", left: "80%" },
-  "область Абай": { top: "45%", left: "82%" },
-  "Восточно-Казахстанская область": { top: "52%", left: "90%" }
+  "город Алматы": { top: "78%", left: "68%" },
+  "Алматинская область": { top: "75%", left: "70%" },
+  "Жамбылская область": { top: "80%", left: "60%" },
+  "Область Абай": { top: "40%", left: "80%" },
+  "Восточно-Казахстанская область": { top: "50%", left: "85%" },
+  "Область Жетысу": { top: "65%", left: "75%" },
 };
 
-export default function SignalsMap({ pollMs = 5000, selectedItem }) {
-  const [signals, setSignals] = useState([]);
+const SignalsMap = ({ signals = [], selectedClient }) => {
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const r = await fetch("http://localhost:3001/api/signals");
-        const j = await r.json();
-        setSignals(Array.isArray(j?.signals) ? j.signals : []);
-      } catch { setSignals([]); }
-    };
-    load();
-    const t = setInterval(load, pollMs);
-    return () => clearInterval(t);
-  }, [pollMs]);
-
-  const getSelectedPos = () => {
-    if (!selectedItem) return null;
-    const name = selectedItem.regionRu || selectedItem.districtRu || selectedItem.cityRu;
-    return REGION_POSITIONS[name] || null;
-  };
-
-  const clientPos = getSelectedPos();
+  // Жестко задаем 4 разных региона для отображения связей, когда кликнули на клиента
+  const networkRegions = [
+    "город Астана", 
+    "город Алматы", 
+    "Атырауская область", 
+    "Восточно-Казахстанская область"
+  ];
 
   return (
-    <div style={{ position: "relative", backgroundColor: "#ffffff", padding: "30px", borderRadius: "20px" }}>
-      <style>{`
-        @keyframes pulse-red {
-          0% { transform: translate(-50%, -50%) scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
-          70% { transform: translate(-50%, -50%) scale(1.2); box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
-          100% { transform: translate(-50%, -50%) scale(1); box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
-        }
-        @keyframes pulse-green {
-          0% { transform: translate(-50%, -50%) scale(1); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
-          70% { transform: translate(-50%, -50%) scale(1.2); box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
-          100% { transform: translate(-50%, -50%) scale(1); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
-        }
-        @keyframes megaRadar {
-          0% { width: 14px; height: 14px; opacity: 1; }
-          100% { width: 80px; height: 80px; opacity: 0; }
-        }
-      `}</style>
-      
-      <div style={{ textAlign: 'center', marginBottom: '25px', color: '#718096', letterSpacing: '1.5px', fontSize: '11px', fontWeight: '700' }}>
-        <MapPin size={14} color="#10b981" style={{ verticalAlign: 'middle', marginRight: 8 }} />
-        LIVE GEOSPATIAL MONITORING
-      </div>
+    <div style={{ position: "relative", width: "100%", maxWidth: "800px", margin: "0 auto", padding: "20px" }}>
+      <div style={{ position: "relative", width: "100%" }}>
+        <img src={mapImage} alt="Map of Kazakhstan" style={{ width: "100%", height: "auto", opacity: 0.9 }} />
 
-      <div style={{ position: "relative", width: "100%", maxWidth: "850px", margin: "0 auto" }}>
-        <img src={mapImage} alt="Map" style={{ width: "100%", opacity: 0.15, filter: 'grayscale(1)' }} />
+        {/* 1. РЕЖИМ ПО УМОЛЧАНИЮ: Клиент не выбран. Показываем тепловую карту рисков */}
+        {!selectedClient && signals.map((s, index) => {
+          const pos = REGION_POSITIONS[s.id];
+          if (!pos) return null;
+          
+          const isHigh = s.level === "HIGH";
+          const delay = index * 0.15;
 
-        {signals.map((s) => {
-          const pos = REGION_POSITIONS[s.id] || { top: "50%", left: "50%" };
           return (
             <div
               key={s.id}
               style={{
-                position: "absolute",
-                top: pos.top,
-                left: pos.left,
-                width: "12px",
-                height: "12px",
-                backgroundColor: s.level === "HIGH" ? "#ef4444" : "#10b981",
-                borderRadius: "50%",
-                border: "2px solid white",
-                animation: s.level === "HIGH" ? "pulse-red 2s infinite" : "pulse-green 2s infinite",
-                zIndex: 5,
-                cursor: 'pointer'
+                position: "absolute", top: pos.top, left: pos.left,
+                width: "14px", height: "14px",
+                backgroundColor: isHigh ? "#ef4444" : "#10b981",
+                borderRadius: "50%", border: "2px solid white",
+                animation: `popIn 0.5s ease-out ${delay}s both, ${isHigh ? "pulse-red" : "pulse-green"} 2s infinite ${delay + 0.5}s`,
+                zIndex: 5, transform: "translate(-50%, -50%)",
+                boxShadow: "0 2px 4px rgba(0,0,0,0.3)"
               }}
-              title={`${s.id}: ${s.count} alerts`}
+              title={`${s.name || s.id}: ${s.count} объектов`}
             />
           );
         })}
 
-        {clientPos && (
-          <div style={{ position: "absolute", top: clientPos.top, left: clientPos.left, zIndex: 100 }}>
-            <div style={{
-              position: "absolute", border: "2px solid #d4af37", borderRadius: "50%",
-              animation: "megaRadar 2s infinite", transform: "translate(-50%, -50%)"
-            }} />
-            <div style={{
-              position: "absolute", border: "2px solid #d4af37", borderRadius: "50%",
-              animation: "megaRadar 2s infinite 1s", transform: "translate(-50%, -50%)"
-            }} />
-            <div style={{
-              width: "14px", height: "14px", backgroundColor: "#d4af37", borderRadius: "2px",
-              transform: "translate(-50%, -50%) rotate(45deg)", border: "2px solid white",
-              boxShadow: "0 0 15px rgba(212, 175, 55, 0.8)", position: "absolute"
-            }} />
-          </div>
-        )}
+        {/* 2. РЕЖИМ ВЫБРАННОГО КЛИЕНТА: Показываем 4 точки в разных регионах */}
+        {selectedClient && networkRegions.map((regionName, idx) => {
+          const pos = REGION_POSITIONS[regionName];
+          if (!pos) return null;
+          
+          // Делаем небольшую задержку для каждой точки, чтобы они появлялись по очереди (эффектно!)
+          const delay = idx * 0.2; 
+
+          return (
+            <div key={idx} style={{ 
+              position: "absolute", top: pos.top, left: pos.left, zIndex: 100,
+              animation: `popIn 0.4s ease-out ${delay}s both`
+            }}>
+              {/* Пульсирующие круги радара */}
+              <div style={{
+                position: "absolute", border: "2px solid #3b82f6", borderRadius: "50%",
+                animation: `megaRadar 2s infinite ${delay}s`, transform: "translate(-50%, -50%)"
+              }} />
+              <div style={{
+                position: "absolute", border: "2px solid #3b82f6", borderRadius: "50%",
+                animation: `megaRadar 2s infinite ${delay + 1}s`, transform: "translate(-50%, -50%)"
+              }} />
+              
+              {/* Сама точка */}
+              <div style={{
+                width: "16px", height: "16px", backgroundColor: "#2563eb", borderRadius: "50%",
+                transform: "translate(-50%, -50%)", border: "3px solid white",
+                boxShadow: "0 0 15px rgba(37, 99, 235, 0.8)", position: "relative", zIndex: 2
+              }} title={`Связь: ${regionName}`} />
+            </div>
+          );
+        })}
+
       </div>
+
+      {/* Стили анимаций */}
+      <style>{`
+        @keyframes pulse-red {
+          0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+          70% { box-shadow: 0 0 0 10px rgba(239, 68, 68, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+        @keyframes pulse-green {
+          0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+          70% { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+        @keyframes megaRadar {
+          0% { width: 0px; height: 0px; opacity: 1; }
+          100% { width: 70px; height: 70px; opacity: 0; }
+        }
+        @keyframes popIn {
+          0% { transform: scale(0); opacity: 0; }
+          80% { transform: scale(1.3); opacity: 1; }
+          100% { transform: scale(1); opacity: 1; }
+        }
+      `}</style>
     </div>
   );
-}
+};
+
+export default SignalsMap;

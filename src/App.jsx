@@ -55,7 +55,7 @@ function App() {
             <FileUp size={32} />
           </div>
           
-          <h2>GreenGuard <span style={{color: '#d4af37'}}>Report</span></h2>
+          <h2>оптимизация процесса отбора заемщиков польготному  <span style={{color: '#d4af37'}}>финансированию</span></h2>
           <p>Загрузите реестр контрагентов в формате Excel для глубокого AML-анализа</p>
 
           <form onSubmit={handleAnalyze}>

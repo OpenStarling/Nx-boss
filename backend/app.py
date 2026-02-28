@@ -209,15 +209,17 @@ async def api_get_iin_by_bin(bin: str = Query(..., description="12-digit BIN")):
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...)):
     """
-    Главный эндпоинт: читает Excel -> берет BIN/IIN -> для BIN подтягивает ИИН (leader+founders)
-    и возвращает:
-      results + individuals + legalEntities + charts
+    Универсальный эндпоинт: читает Excel с БИН или ИИН.
+    Возвращает данные с сохранением исходных колонок (rowData) и найденных связей.
     """
     global LAST_RESULTS
 
     content = await file.read()
     df = parse_excel_auto_header(content, scan_rows=30)
     df.columns = [_norm_low(c) for c in df.columns]
+    
+    # Заменяем NaN на пустые строки, чтобы FastAPI (JSON) не выдавал ошибку
+    df = df.fillna("")
 
     id_col = find_id_col(df)
     if not id_col:
@@ -231,22 +233,25 @@ async def analyze(file: UploadFile = File(...)):
             "legalEntities": [],
         }
 
-    ids_all = [to12(v) for v in df[id_col].tolist()]
-    ids_all = [x for x in ids_all if x]
-    unique_ids = sorted(set(ids_all))
+    # Сохраняем строки в виде словарей, чтобы прокинуть "другие данные" на фронт
+    records = df.to_dict("records")
+    
+    unique_ids = set()
+    for row in records:
+        val = to12(row.get(id_col))
+        if val:
+            unique_ids.add(val)
+            
+    unique_ids = sorted(unique_ids)
 
-    # списки
     individuals: Dict[str, str] = {}
     legal_entities: Dict[str, str] = {}
-
-    # для сортировки по ОКЭД и вывода в results
     bin_meta: Dict[str, Dict[str, Any]] = {}
-
-    # ---------
-    # 1) Сначала обработаем все ЮЛ (BIN): вытащим ИИНы, ОКЭД, регион и имя ЮЛ
-    # ---------
     extra_iins: set[str] = set()
 
+    # ---------
+    # 1) Обрабатываем ЮЛ (BIN)
+    # ---------
     for id12 in unique_ids:
         if infer_entity_type(id12) != "LEGAL":
             continue
@@ -254,42 +259,42 @@ async def analyze(file: UploadFile = File(...)):
         info = await get_iins_by_bin(id12)
         bin_meta[id12] = info
 
-        # имя ЮЛ
         org_name = info.get("orgNameRu") or f"ЮЛ {id12}"
         legal_entities[id12] = org_name
 
-        # ИИН руководителя
         li = to12(info.get("leaderIIN"))
         if li:
             extra_iins.add(li)
 
-        # ИИН учредителей
         for fi in info.get("foundersIINs") or []:
             t = to12(fi)
             if t:
                 extra_iins.add(t)
 
     # ---------
-    # 2) Заполним individuals (хотя бы “ФЛ {iin}”), можно расширить реальным ФИО позже
+    # 2) Заполняем ФЛ (IIN)
     # ---------
     people_cache = load_people_cache()
-
     for iin in sorted(extra_iins):
-        # если когда-то будете тянуть ФИО по ИИН — сохраняйте в people_cache
         name = (people_cache.get(iin) or {}).get("name") or f"ФЛ {iin}"
         individuals[iin] = name
-
     save_people_cache(people_cache)
 
     # ---------
-    # 3) Теперь формируем results по исходным ids_all (как у вас таблица риска)
+    # 3) Формируем results, проходя по ВСЕМ строкам файла (чтобы сохранить дубли/порядок)
     # ---------
     results: List[Dict[str, Any]] = []
 
-    for id12 in ids_all:
-        typ = infer_entity_type(id12)
+    for row in records:
+        id12 = to12(row.get(id_col))
+        if not id12:
+            continue
 
-        # имя
+        typ = infer_entity_type(id12)
+        
+        leader_iin = None
+        founders = []
+
         if typ == "LEGAL":
             name = legal_entities.get(id12) or f"ЮЛ {id12}"
             meta = bin_meta.get(id12) or {}
@@ -297,43 +302,44 @@ async def analyze(file: UploadFile = File(...)):
             oked_name = meta.get("okedNameRu")
             district = meta.get("districtRu")
             city = meta.get("cityRu")
+            
+            # Извлекаем ИИНы для ответа
+            leader_iin = to12(meta.get("leaderIIN"))
+            founders = [to12(f) for f in (meta.get("foundersIINs") or []) if to12(f)]
         else:
             name = individuals.get(id12) or f"ФЛ {id12}"
             oked = None
             oked_name = None
             district = None
             city = None
-            individuals[id12] = name  # если ИИН был в Excel
+            individuals[id12] = name  # если ИИН изначально был в Excel
 
         score, reasons = heuristic_score(id12)
         risk_level = level_from_score(score)
 
         results.append({
-            # ваш UI формат
             "bin": id12,
             "name": name,
-
-            # совместимость со старым UI
             "id": id12,
             "displayName": name,
-
             "entityType": typ,
             "riskScore": int(score),
             "riskLevel": risk_level,
             "reasons": reasons,
-
-            # ОКЭД
             "oked": oked,
             "okedName": oked_name,
             "okedNameRu": oked_name,
-
-            # регион
             "districtRu": district,
             "cityRu": city,
+            
+            # НОВЫЕ ПОЛЯ:
+            "leaderIIN": leader_iin,
+            "foundersIINs": founders,
+            "rowData": row  # <-- Здесь лежат все остальные колонки из Excel таблицы
         })
 
     # ---------
-    # 4) Сортировка по ОКЭД (сначала где есть ОКЭД, потом по коду, потом по риску)
+    # 4) Сортировка по ОКЭД
     # ---------
     results.sort(
         key=lambda r: (
@@ -348,14 +354,13 @@ async def analyze(file: UploadFile = File(...)):
     return {
         "rowsAnalyzed": len(results),
         "results": results,
-        "sharedIINCount": 0,
+        "sharedIINCount": len(extra_iins),
         "charts": build_charts(results),
         "individuals": [{"id": k, "name": v} for k, v in sorted(individuals.items())],
         "legalEntities": [{"id": k, "name": v} for k, v in sorted(legal_entities.items())],
     }
 
 
-# (опционально) если у вас есть карта сигналов — можете оставить/убрать
 @app.get("/api/signals")
 async def signals():
     agg = defaultdict(lambda: {"count": 0, "high": 0, "medium": 0, "low": 0})
@@ -373,7 +378,6 @@ async def signals():
         else:
             agg[district]["low"] += 1
 
-    # Если у вас нет координат — просто вернем агрегацию
     out = []
     for district, a in agg.items():
         level = "LOW"
