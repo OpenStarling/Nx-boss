@@ -1,12 +1,12 @@
 import React, { useState } from "react";
 import "./App.css";
 import AnalyticsDashboard from "./AnalyticsDashboard";
-import "leaflet/dist/leaflet.css";
+import { FileUp, Search, Loader2 } from "lucide-react";
 
 function App() {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState(null);
-  const [view, setView] = useState("home"); // home | scanning | result
+  const [view, setView] = useState("home"); // home | result
   const [error, setError] = useState("");
 
   const handleAnalyze = async (e) => {
@@ -15,76 +15,76 @@ function App() {
 
     const file = e.target?.file?.files?.[0];
     if (!file) {
-      setError("Выберите Excel-файл (.xlsx) перед анализом.");
+      setError("Пожалуйста, выберите файл .xlsx");
       return;
     }
 
     setLoading(true);
-    setView("scanning");
-
     try {
       const formData = new FormData();
       formData.append("file", file);
 
       const response = await fetch("/api/analyze", { method: "POST", body: formData });
+      const payload = await response.json();
 
-      // читаем body ОДИН раз
-      const raw = await response.text();
-      let payload = null;
-      try { payload = raw ? JSON.parse(raw) : null; } catch {}
+      console.log("📦 ПОЛНЫЙ ОТВЕТ ОТ БЭКЕНДА:", payload);
 
       if (!response.ok) {
-        const detail = (payload && (payload.detail || payload.message)) || raw || `HTTP ${response.status}`;
-        throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+        throw new Error(payload.detail || "Ошибка сервера");
       }
-
-      if (!payload) throw new Error("Сервер вернул пустой ответ.");
 
       setData(payload);
       setView("result");
     } catch (err) {
-      console.error(err);
-      setError(`Ошибка сервера: ${String(err?.message || err)}`);
-      setView("home");
-      setData(null);
+      setError(err.message);
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="app">
-      <main className="app-main">
-        {view === "home" && (
-          <div className="card">
-            <h2>Загрузка реестра</h2>
-            <p style={{ opacity: 0.8 }}>Загрузите Excel (.xlsx) с колонкой БИН/ИИН.</p>
-
-            <form onSubmit={handleAnalyze} className="form">
-              <input name="file" type="file" accept=".xlsx,.xls" disabled={loading} />
-              <button type="submit" disabled={loading} className="btn">
-                {loading ? "Анализируем..." : "Запустить анализ"}
-              </button>
-            </form>
-
-            {error && <div className="error-box" style={{ marginTop: 12 }}>{error}</div>}
+    <div className="app-container">
+      {view === "home" ? (
+        <div className="welcome-card">
+          <div style={{ 
+            width: 60, height: 60, background: '#f0fdf4', 
+            borderRadius: '50%', display: 'flex', 
+            alignItems: 'center', justifyContent: 'center', 
+            margin: '0 auto 20px', color: '#10b981'
+          }}>
+            <FileUp size={32} />
           </div>
-        )}
+          
+          <h2>GreenGuard <span style={{color: '#d4af37'}}>Report</span></h2>
+          <p>Загрузите реестр контрагентов в формате Excel для глубокого AML-анализа</p>
 
-        {view === "scanning" && (
-          <div className="card">
-            <h2>Получаем имена через API…</h2>
-            <p style={{ opacity: 0.8 }}>
-              Если файл большой — первый раз может быть дольше. Повторно будет быстрее (кеш).
-            </p>
-            <div className="loader-wrap" style={{ marginTop: 18 }}>
-              <div className="loader" />
-            </div>
+          <form onSubmit={handleAnalyze}>
+            <input 
+              name="file" 
+              type="file" 
+              accept=".xlsx,.xls" 
+              className="file-upload-input"
+              disabled={loading} 
+            />
+            
+            <button type="submit" className="btn-start" disabled={loading}>
+              {loading ? (
+                <span style={{display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10}}>
+                  <Loader2 className="animate-spin" size={20} /> Анализ данных...
+                </span>
+              ) : "Запустить мониторинг"}
+            </button>
+          </form>
+
+          {error && <div className="error-msg">{error}</div>}
+          
+          <div style={{marginTop: 30, fontSize: 11, color: '#cbd5e1', letterSpacing: 1}}>
+            SECURE CLOUD PROCESSING
           </div>
-        )}
-
-        {view === "result" && <AnalyticsDashboard data={data} />}
-      </main>
+        </div>
+      ) : (
+        <AnalyticsDashboard data={data} />
+      )}
     </div>
   );
 }
