@@ -1,63 +1,24 @@
 from __future__ import annotations
-from iin_service import get_iins_by_bin
+
 import io
-import os
 import re
 import json
-import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from collections import Counter, defaultdict
 
 import pandas as pd
-import httpx
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from iin_service import get_iins_by_bin
+
 
 # ============================================================
-# SETTINGS (env)
+# Cache
 # ============================================================
-GBDUL_BIN_URL = os.getenv("GBDUL_BIN_URL", "").strip()
-GBDUL_IIN_URL = os.getenv("GBDUL_IIN_URL", "").strip()
-
-GBDUL_REQUESTOR_BIN = os.getenv("GBDUL_REQUESTOR_BIN", "970840000277").strip()
-GBDUL_BASIC = os.getenv("GBDUL_BASIC", "").strip()
-GBDUL_CONCURRENCY = int(os.getenv("GBDUL_CONCURRENCY", "25"))
-
-CACHE_PROFILES_PATH = Path("cache_profiles.json")
+CACHE_PROFILES_PATH = Path("cache_people.json")  # кэш ФЛ по ИИН (имена можно подгружать позже)
 LAST_RESULTS: List[Dict[str, Any]] = []
-
-
-# ============================================================
-# REGION CENTERS
-# ============================================================
-REGION_CENTERS = {
-    "Акмолинская область": (51.169392, 71.449074),
-    "Актюбинская область": (50.283937, 57.166978),
-    "Алматинская область": (43.238949, 76.889709),
-    "Атырауская область": (47.094495, 51.923837),
-    "Восточно-Казахстанская область": (49.948296, 82.628459),
-    "Жамбылская область": (42.900000, 71.366700),
-    "Западно-Казахстанская область": (51.222300, 51.370000),
-    "Карагандинская область": (49.806405, 73.085531),
-    "Костанайская область": (53.214350, 63.624630),
-    "Кызылординская область": (44.848800, 65.482300),
-    "Мангистауская область": (43.653500, 51.197500),
-    "Павлодарская область": (52.287303, 76.967402),
-    "Северо-Казахстанская область": (54.872800, 69.143000),
-    "Туркестанская область": (42.300000, 69.600000),
-    "Улытауская область": (47.800000, 67.700000),
-    "Абайская область": (50.411110, 80.227500),
-    "Жетысуская область": (45.015600, 78.373900),
-
-    "город Астана": (51.169392, 71.449074),
-    "город Алматы": (43.238949, 76.889709),
-    "город Шымкент": (42.341700, 69.590100),
-
-    # старое имя
-    "город Нур-Султан": (51.169392, 71.449074),
-}
 
 
 # ============================================================
@@ -65,11 +26,14 @@ REGION_CENTERS = {
 # ============================================================
 BIN_WORD_RE = re.compile(r"(?:^|\b)(бин|bin|иин|iin)(?:\b|$)", re.IGNORECASE)
 
+
 def _norm(x: Any) -> str:
     return re.sub(r"\s+", " ", str(x or "")).strip()
 
+
 def _norm_low(x: Any) -> str:
     return _norm(x).lower()
+
 
 def to12(v: Any) -> Optional[str]:
     digits = re.sub(r"\D", "", str(v or ""))
@@ -77,62 +41,46 @@ def to12(v: Any) -> Optional[str]:
         return None
     return digits[-12:].rjust(12, "0")
 
+
 def infer_entity_type(id12: str) -> str:
+    """
+    Эвристика: ИИН похож на дату рождения (yy mm dd) и 7й символ 1..6
+    """
     if not id12 or len(id12) != 12:
         return "UNKNOWN"
     try:
         mm = int(id12[2:4])
         dd = int(id12[4:6])
         s = id12[6]
-        # эвристика ИИН
         if 1 <= mm <= 12 and 1 <= dd <= 31 and s in "123456":
             return "INDIVIDUAL"
         return "LEGAL"
     except Exception:
         return "UNKNOWN"
 
-def safe_int(x: Any, default: int = 0) -> int:
+
+def safe_int(x: Any, default: int = 999999) -> int:
     try:
         s = re.sub(r"\D", "", str(x or ""))
         return int(s) if s else default
     except Exception:
         return default
 
-def normalize_region(x: Any) -> Optional[str]:
-    s = _norm(x)
-    if not s:
-        return None
-    s = s.replace("г.", "город ").replace("Г.", "город ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
 
-def _auth_headers() -> Dict[str, str]:
-    h = {"Content-Type": "application/json"}
-    if GBDUL_BASIC:
-        h["Authorization"] = GBDUL_BASIC
-    return h
-
-def _pick_first(d: dict, keys: List[str]) -> Optional[str]:
-    for k in keys:
-        v = d.get(k)
-        if v is not None and str(v).strip():
-            return str(v).strip()
-    return None
-
-def _get_nested(obj: dict, *keys: str) -> Any:
-    cur: Any = obj
-    for k in keys:
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(k)
-    return cur
-
-def _find_first_dict(obj: dict, candidates: List[Tuple[str, ...]]) -> dict:
-    for path in candidates:
-        got = _get_nested(obj, *path)
-        if isinstance(got, dict):
-            return got
+def load_people_cache() -> Dict[str, Dict[str, Any]]:
+    if CACHE_PROFILES_PATH.exists():
+        try:
+            return json.loads(CACHE_PROFILES_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
     return {}
+
+
+def save_people_cache(cache: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        CACHE_PROFILES_PATH.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -161,6 +109,7 @@ def parse_excel_auto_header(content: bytes, scan_rows: int = 30) -> pd.DataFrame
     df = df.dropna(how="all")
     return df
 
+
 def find_id_col(df: pd.DataFrame) -> Optional[str]:
     for c in df.columns:
         cc = _norm_low(c)
@@ -186,179 +135,6 @@ def find_id_col(df: pd.DataFrame) -> Optional[str]:
 
 
 # ============================================================
-# Cache
-# ============================================================
-def load_profiles_cache() -> Dict[str, Dict[str, Any]]:
-    if CACHE_PROFILES_PATH.exists():
-        try:
-            return json.loads(CACHE_PROFILES_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-def save_profiles_cache(cache: Dict[str, Dict[str, Any]]) -> None:
-    try:
-        CACHE_PROFILES_PATH.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
-
-
-# ============================================================
-# Parse profiles (ЮЛ/ФЛ)
-# ============================================================
-def parse_legal_profile(j: dict) -> Dict[str, Any]:
-    # организация
-    org = _find_first_dict(j, [("data", "organization"), ("organization",), ("data", "org"), ("org",)])
-    name = _pick_first(org, ["fullNameRu", "fullNameKz", "fullNameEn", "shortNameRu", "shortNameKz", "nameRu", "nameKz", "name", "title"])
-
-    # activity / OKED
-    activity = _find_first_dict(j, [
-        ("data", "organization", "activity"),
-        ("organization", "activity"),
-        ("data", "activity"),
-        ("activity",),
-    ])
-    oked = activity.get("OKED") or activity.get("oked")
-    oked_name_ru = activity.get("activityNameRu") or activity.get("nameRu")
-
-    # address
-    addr = _find_first_dict(j, [
-        ("data", "organization", "address"),
-        ("organization", "address"),
-        ("data", "address"),
-        ("address",),
-    ])
-    districtRu = addr.get("districtRu") or addr.get("districtKz")
-    regionRu = addr.get("regionRu") or addr.get("regionKz")
-    cityRu = addr.get("cityRu") or addr.get("cityKz")
-
-    # form of law
-    formOfLaw = _find_first_dict(j, [
-        ("data", "organization", "formOfLaw"),
-        ("organization", "formOfLaw"),
-        ("data", "formOfLaw"),
-        ("formOfLaw",),
-    ])
-    formOfLawRu = formOfLaw.get("nameRu") or formOfLaw.get("nameKz")
-
-    # orgSize
-    stat = _find_first_dict(j, [
-        ("data", "organization", "statCommInfo"),
-        ("organization", "statCommInfo"),
-        ("data", "statCommInfo"),
-        ("statCommInfo",),
-    ])
-    orgSize = _find_first_dict(stat, [("orgSize",)])
-    orgSizeRu = orgSize.get("nameRu") or orgSize.get("nameKz")
-
-    # ✅ ИИНы внутри ЮЛ (то, чего не хватало)
-    leader = org.get("organizationLeader") or {}
-    leader_iin = leader.get("IIN") or leader.get("iin")
-
-    founders_fl = org.get("foundersFL") or []
-    founders_iins: List[str] = []
-    for f in founders_fl:
-        if isinstance(f, dict):
-            iin = f.get("IIN") or f.get("iin")
-            if iin:
-                founders_iins.append(iin)
-
-    return {
-        "name": name,
-        "oked": oked,
-        "okedNameRu": oked_name_ru,
-        "districtRu": normalize_region(districtRu),
-        "regionRu": normalize_region(regionRu),
-        "cityRu": cityRu,
-        "formOfLawRu": formOfLawRu,
-        "orgSizeRu": orgSizeRu,
-
-        # ✅ добавили
-        "leaderIIN": leader_iin,
-        "foundersIINs": founders_iins,
-    }
-
-def parse_person_profile(j: dict) -> Dict[str, Any]:
-    data = j.get("data") if isinstance(j.get("data"), dict) else {}
-
-    name = None
-    for boxpath in [("data", "person"), ("data", "individual"), ("person",), ("individual",)]:
-        box = _get_nested(j, *boxpath)
-        if isinstance(box, dict):
-            name = _pick_first(box, ["fullNameRu", "fullNameKz", "fullNameEn", "fio", "fullName", "name"])
-            if name:
-                break
-
-    if not name:
-        if isinstance(data, dict):
-            name = _pick_first(data, ["fullNameRu", "fio", "fullName", "name"])
-        if not name:
-            name = _pick_first(j, ["fio", "fullName", "name"])
-
-    addr = _find_first_dict(j, [("data", "address"), ("address",)])
-    districtRu = addr.get("districtRu") or addr.get("districtKz")
-    regionRu = addr.get("regionRu") or addr.get("regionKz")
-    cityRu = addr.get("cityRu") or addr.get("cityKz")
-
-    return {
-        "name": name,
-        "districtRu": normalize_region(districtRu),
-        "regionRu": normalize_region(regionRu),
-        "cityRu": cityRu,
-    }
-
-
-# ============================================================
-# Fetch profiles
-# ============================================================
-async def gbdul_fetch_legal(bin12: str) -> Optional[Dict[str, Any]]:
-    if not GBDUL_BIN_URL:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            r = await client.post(
-                GBDUL_BIN_URL,
-                json={"bin": bin12, "requestor_bin": GBDUL_REQUESTOR_BIN},
-                headers=_auth_headers(),
-            )
-            r.raise_for_status()
-            j = r.json()
-        return parse_legal_profile(j)
-    except Exception:
-        return None
-
-async def gbdul_fetch_person(iin12: str) -> Optional[Dict[str, Any]]:
-    if not GBDUL_IIN_URL:
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            r = await client.post(
-                GBDUL_IIN_URL,
-                json={"iin": iin12, "requestor_bin": GBDUL_REQUESTOR_BIN},
-                headers=_auth_headers(),
-            )
-            r.raise_for_status()
-            j = r.json()
-        return parse_person_profile(j)
-    except Exception:
-        return None
-
-async def batch_fetch_profiles(ids: List[str], concurrency: int) -> Dict[str, Dict[str, Any]]:
-    sem = asyncio.Semaphore(max(1, concurrency))
-    out: Dict[str, Dict[str, Any]] = {}
-
-    async def one(x: str):
-        async with sem:
-            typ = infer_entity_type(x)
-            prof = await (gbdul_fetch_legal(x) if typ == "LEGAL" else gbdul_fetch_person(x))
-            if prof:
-                out[x] = prof
-
-    await asyncio.gather(*(one(i) for i in ids))
-    return out
-
-
-# ============================================================
 # Scoring + charts
 # ============================================================
 def level_from_score(score: int) -> str:
@@ -368,6 +144,7 @@ def level_from_score(score: int) -> str:
         return "MEDIUM"
     return "LOW"
 
+
 def bucket_score(score: int, step: int = 10) -> str:
     score = max(0, min(100, int(score)))
     lo = (score // step) * step
@@ -376,11 +153,13 @@ def bucket_score(score: int, step: int = 10) -> str:
         return "100"
     return f"{lo}-{hi}"
 
+
 def heuristic_score(id12: str) -> Tuple[int, List[str]]:
     # демо скоринг
     score = 50 + (int(id12[-1]) * 3) % 30
     score = max(0, min(100, score))
     return score, ["Скоринг демо-режим (для хакатона)."]
+
 
 def build_charts(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     level_counts = Counter([r.get("riskLevel") for r in results])
@@ -401,7 +180,7 @@ def build_charts(results: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ============================================================
 # FastAPI
 # ============================================================
-app = FastAPI(title="NX-BOSS Backend", version="8.0.0")
+app = FastAPI(title="NX-BOSS Backend", version="9.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -410,16 +189,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/api/get-iin-by-bin")
-async def api_get_iin_by_bin(bin: str):
-    return await get_iins_by_bin(bin)
 
 @app.get("/api/health")
 async def health():
     return {"ok": True}
 
+
+@app.get("/api/get-iin-by-bin")
+async def api_get_iin_by_bin(bin: str = Query(..., description="12-digit BIN")):
+    """
+    Проверочный эндпоинт: вернёт leaderIIN + foundersIINs по БИН
+    """
+    b = to12(bin)
+    if not b:
+        return {"error": "Invalid BIN"}
+    return await get_iins_by_bin(b)
+
+
 @app.post("/api/analyze")
 async def analyze(file: UploadFile = File(...)):
+    """
+    Главный эндпоинт: читает Excel -> берет BIN/IIN -> для BIN подтягивает ИИН (leader+founders)
+    и возвращает:
+      results + individuals + legalEntities + charts
+    """
     global LAST_RESULTS
 
     content = await file.read()
@@ -442,56 +235,85 @@ async def analyze(file: UploadFile = File(...)):
     ids_all = [x for x in ids_all if x]
     unique_ids = sorted(set(ids_all))
 
-    # 1) сначала получаем профили по тем id, которые пришли из Excel
-    cache = load_profiles_cache()
-    missing = [i for i in unique_ids if i not in cache]
-    if missing:
-        fetched = await batch_fetch_profiles(missing, concurrency=GBDUL_CONCURRENCY)
-        cache.update(fetched)
-        save_profiles_cache(cache)
+    # списки
+    individuals: Dict[str, str] = {}
+    legal_entities: Dict[str, str] = {}
 
-    # 2) ✅ теперь вытаскиваем ИИНы из ЮЛ (leader + founders) и докачиваем профили ФЛ
+    # для сортировки по ОКЭД и вывода в results
+    bin_meta: Dict[str, Dict[str, Any]] = {}
+
+    # ---------
+    # 1) Сначала обработаем все ЮЛ (BIN): вытащим ИИНы, ОКЭД, регион и имя ЮЛ
+    # ---------
     extra_iins: set[str] = set()
+
     for id12 in unique_ids:
         if infer_entity_type(id12) != "LEGAL":
             continue
-        prof = cache.get(id12) or {}
-        li = to12(prof.get("leaderIIN"))
+
+        info = await get_iins_by_bin(id12)
+        bin_meta[id12] = info
+
+        # имя ЮЛ
+        org_name = info.get("orgNameRu") or f"ЮЛ {id12}"
+        legal_entities[id12] = org_name
+
+        # ИИН руководителя
+        li = to12(info.get("leaderIIN"))
         if li:
             extra_iins.add(li)
-        for fi in (prof.get("foundersIINs") or []):
+
+        # ИИН учредителей
+        for fi in info.get("foundersIINs") or []:
             t = to12(fi)
             if t:
                 extra_iins.add(t)
 
-    missing_extra = [i for i in sorted(extra_iins) if i not in cache]
-    if missing_extra:
-        fetched_extra = await batch_fetch_profiles(missing_extra, concurrency=GBDUL_CONCURRENCY)
-        cache.update(fetched_extra)
-        save_profiles_cache(cache)
+    # ---------
+    # 2) Заполним individuals (хотя бы “ФЛ {iin}”), можно расширить реальным ФИО позже
+    # ---------
+    people_cache = load_people_cache()
 
-    # 3) формируем results + списки individuals/legalEntities
+    for iin in sorted(extra_iins):
+        # если когда-то будете тянуть ФИО по ИИН — сохраняйте в people_cache
+        name = (people_cache.get(iin) or {}).get("name") or f"ФЛ {iin}"
+        individuals[iin] = name
+
+    save_people_cache(people_cache)
+
+    # ---------
+    # 3) Теперь формируем results по исходным ids_all (как у вас таблица риска)
+    # ---------
     results: List[Dict[str, Any]] = []
-    individuals: Dict[str, str] = {}
-    legal_entities: Dict[str, str] = {}
 
     for id12 in ids_all:
         typ = infer_entity_type(id12)
-        prof = cache.get(id12) or {}
 
-        name = prof.get("name")
-        if not name:
-            name = ("ФЛ " if typ == "INDIVIDUAL" else "ЮЛ ") + id12
+        # имя
+        if typ == "LEGAL":
+            name = legal_entities.get(id12) or f"ЮЛ {id12}"
+            meta = bin_meta.get(id12) or {}
+            oked = meta.get("oked")
+            oked_name = meta.get("okedNameRu")
+            district = meta.get("districtRu")
+            city = meta.get("cityRu")
+        else:
+            name = individuals.get(id12) or f"ФЛ {id12}"
+            oked = None
+            oked_name = None
+            district = None
+            city = None
+            individuals[id12] = name  # если ИИН был в Excel
 
         score, reasons = heuristic_score(id12)
         risk_level = level_from_score(score)
 
-        res_item = {
-            # ✅ новый формат (ваш текущий UI)
+        results.append({
+            # ваш UI формат
             "bin": id12,
             "name": name,
 
-            # ✅ старый формат (чтобы ничего не слетало)
+            # совместимость со старым UI
             "id": id12,
             "displayName": name,
 
@@ -500,35 +322,19 @@ async def analyze(file: UploadFile = File(...)):
             "riskLevel": risk_level,
             "reasons": reasons,
 
-            # ✅ OKED
-            "oked": prof.get("oked"),
-            "okedName": prof.get("okedNameRu"),
-            "okedNameRu": prof.get("okedNameRu"),
+            # ОКЭД
+            "oked": oked,
+            "okedName": oked_name,
+            "okedNameRu": oked_name,
 
-            # ✅ адреса
-            "districtRu": normalize_region(prof.get("districtRu")),
-            "regionRu": normalize_region(prof.get("regionRu")),
-            "cityRu": prof.get("cityRu"),
+            # регион
+            "districtRu": district,
+            "cityRu": city,
+        })
 
-            # доп
-            "orgSizeRu": prof.get("orgSizeRu"),
-            "formOfLawRu": prof.get("formOfLawRu"),
-        }
-
-        results.append(res_item)
-
-        if typ == "INDIVIDUAL":
-            individuals[id12] = name
-        elif typ == "LEGAL":
-            legal_entities[id12] = name
-
-    # ✅ добавляем ФЛ из leader/founders в individuals, даже если их не было в Excel
-    for iin12 in sorted(extra_iins):
-        prof = cache.get(iin12) or {}
-        nm = prof.get("name") or ("ФЛ " + iin12)
-        individuals[iin12] = nm
-
-    # 4) ✅ сортировка по ОКЭД (числом), затем по риску
+    # ---------
+    # 4) Сортировка по ОКЭД (сначала где есть ОКЭД, потом по коду, потом по риску)
+    # ---------
     results.sort(
         key=lambda r: (
             0 if r.get("oked") else 1,
@@ -544,19 +350,20 @@ async def analyze(file: UploadFile = File(...)):
         "results": results,
         "sharedIINCount": 0,
         "charts": build_charts(results),
-        "individuals": [{"id": k, "name": v} for k, v in individuals.items()],
-        "legalEntities": [{"id": k, "name": v} for k, v in legal_entities.items()],
+        "individuals": [{"id": k, "name": v} for k, v in sorted(individuals.items())],
+        "legalEntities": [{"id": k, "name": v} for k, v in sorted(legal_entities.items())],
     }
 
+
+# (опционально) если у вас есть карта сигналов — можете оставить/убрать
 @app.get("/api/signals")
 async def signals():
     agg = defaultdict(lambda: {"count": 0, "high": 0, "medium": 0, "low": 0})
 
     for r in LAST_RESULTS:
-        district = r.get("districtRu") or r.get("regionRu")
+        district = r.get("districtRu")
         if not district:
             continue
-
         agg[district]["count"] += 1
         lvl = (r.get("riskLevel") or "LOW").upper()
         if lvl == "HIGH":
@@ -566,29 +373,26 @@ async def signals():
         else:
             agg[district]["low"] += 1
 
+    # Если у вас нет координат — просто вернем агрегацию
     out = []
     for district, a in agg.items():
-        if district not in REGION_CENTERS:
-            continue
-
-        lat, lng = REGION_CENTERS[district]
         level = "LOW"
         if a["high"] > 0:
             level = "HIGH"
         elif a["medium"] > 0:
             level = "MEDIUM"
-
         out.append({
             "id": district,
             "name": district,
-            "lat": lat,
-            "lng": lng,
+            "lat": 0,
+            "lng": 0,
             "level": level,
             "count": a["count"],
             "message": f"HIGH: {a['high']} | MEDIUM: {a['medium']} | LOW: {a['low']}",
         })
 
     return {"signals": out}
+
 
 @app.get("/api/debug/last")
 async def debug_last():
