@@ -168,7 +168,7 @@ const AnalyticsDashboard = ({ data }) => {
 
   const exportPDF = () => {
     html2pdf().from(document.getElementById("pdf-area")).set({
-      margin: 10, filename: "GreenGuard_Report.pdf", html2canvas: { scale: 2 }, jsPDF: { orientation: "landscape", format: "a3" }
+      margin: 10, filename: "офиоированность.pdf", html2canvas: { scale: 2 }, jsPDF: { orientation: "landscape", format: "a3" }
     }).save();
   };
 
@@ -192,7 +192,7 @@ const AnalyticsDashboard = ({ data }) => {
     <div className="dashboard-wrapper">
       <header className="main-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", padding: "0 40px" }}>
         <div className="logo-container">
-          <div className="logo-box">G</div><div className="logo-text">GreenGuard <span style={{ color: "#d4af37" }}>Intelligence</span></div>
+          
         </div>
         <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
           <Globe size={18} color="#718096" />
